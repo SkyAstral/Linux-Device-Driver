@@ -1,0 +1,12 @@
+[Unit]
+Description=Bind MT7902 USB Bluetooth to the adapted driver
+After=systemd-udev-trigger.service
+Before=bluetooth.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/bind-mt7902-bluetooth
+TimeoutStartSec=45
+
+[Install]
+WantedBy=multi-user.target
