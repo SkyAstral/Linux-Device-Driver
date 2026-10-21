@@ -1,3 +1,0 @@
--- Logs begin at Tue 2026-09-29 20:01:32 CST, end at Tue 2026-10-13 11:34:46 CST. --
-10月 13 11:34:39 starry kernel: usbcore: registered new interface driver btusb_mt7902
-10月 13 11:34:39 starry kernel: Bluetooth: hci0: MT7902 adapter: chip=00007902 fw=00008a00 file=mediatek/BT_RAM_CODE_MT7902_1_1_hdr.bin

@@ -1,1 +1,0 @@
-ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_interface", ATTR{bInterfaceNumber}=="00", ATTRS{idVendor}=="13d3", ATTRS{idProduct}=="3596", TAG+="systemd", ENV{SYSTEMD_WANTS}+="mt7902-bluetooth.service"

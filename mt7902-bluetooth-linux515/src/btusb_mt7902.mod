@@ -1,2 +1,0 @@
-/home/starry/文档/mt7902-bluetooth-linux515/src/btusb_mt7902.o
-
