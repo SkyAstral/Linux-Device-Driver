@@ -1,0 +1,20 @@
+[Unit]
+Description=SX360 screen live CPU temperature
+After=systemd-udev-trigger.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/sx360-linux
+ExecStartPre=/bin/sh /opt/sx360-linux/temperature/load.sh
+ExecStart=/usr/bin/python3 -u /opt/sx360-linux/sx360.py watch --experimental-write --interval 1
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=10
+UMask=0077
+NoNewPrivileges=yes
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

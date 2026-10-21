@@ -1,0 +1,1361 @@
+--- a/src/Makefile
++++ b/src/Makefile
+@@ -5,7 +5,7 @@
+     tx.o agg-rx.o mcu.o wed.o scan.o channel.o
+ 
+ mt7902e-y += \
+-    mt76_connac_mcu.o mt76_connac_mac.o mt76_connac3_mac.o
++    mt76_connac_mcu.o mt76_connac_mac.o
+ 
+ mt7902e-y += \
+     mt792x_core.o mt792x_mac.o mt792x_trace.o \
+--- a/src/channel.c
++++ b/src/channel.c
+@@ -105,7 +105,7 @@
+ 	struct mt76_chanctx *ctx = (struct mt76_chanctx *)conf->drv_priv;
+ 	struct mt76_vif_link *mlink = (struct mt76_vif_link *)vif->drv_priv;
+ 	struct mt76_vif_data *mvif = mlink->mvif;
+-	int link_id = link_conf->link_id;
++	int link_id = 0; /* single link in 5.15 */
+ 	struct mt76_phy *phy = ctx->phy;
+ 	struct mt76_dev *dev = phy->dev;
+ 	bool mlink_alloc = false;
+@@ -156,7 +156,7 @@
+ 	struct mt76_chanctx *ctx = (struct mt76_chanctx *)conf->drv_priv;
+ 	struct mt76_vif_link *mlink = (struct mt76_vif_link *)vif->drv_priv;
+ 	struct mt76_vif_data *mvif = mlink->mvif;
+-	int link_id = link_conf->link_id;
++	int link_id = 0; /* single link in 5.15 */
+ 	struct mt76_phy *phy = ctx->phy;
+ 	struct mt76_dev *dev = phy->dev;
+ 
+@@ -233,15 +233,15 @@
+ 		goto skip_link_replace;
+ 
+ 	for (i = 0; i < n_vifs; i++) {
+-		mlink = mt76_vif_conf_link(dev, vifs[i].vif, vifs[i].link_conf);
++		mlink = mt76_vif_conf_link(dev, vifs[i].vif, &vifs[i].vif->bss_conf);
+ 		if (!mlink)
+ 			continue;
+ 
+ 		dev->drv->vif_link_remove(old_phy, vifs[i].vif,
+-					  vifs[i].link_conf, mlink);
++					  &vifs[i].vif->bss_conf, mlink);
+ 
+ 		ret = dev->drv->vif_link_add(phy, vifs[i].vif,
+-					     vifs[i].link_conf, mlink);
++					     &vifs[i].vif->bss_conf, mlink);
+ 		if (ret)
+ 			goto out;
+ 
+@@ -249,7 +249,7 @@
+ 
+ skip_link_replace:
+ 	for (i = 0; i < n_vifs; i++) {
+-		mlink = mt76_vif_conf_link(dev, vifs[i].vif, vifs[i].link_conf);
++		mlink = mt76_vif_conf_link(dev, vifs[i].vif, &vifs[i].vif->bss_conf);
+ 		if (!mlink)
+ 			continue;
+ 
+--- /dev/null
++++ b/src/compat515.h
+@@ -0,0 +1,26 @@
++/* PCIe-only compatibility: MT7902 has no MediaTek SoC WED engine. */
++#ifndef MT7902_COMPAT515_H
++#define MT7902_COMPAT515_H
++#include <linux/version.h>
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0) || LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0)
++#error "This experimental port targets Linux 5.15 only"
++#endif
++#define ieee80211_link_sta ieee80211_sta
++#ifndef __counted_by
++#define __counted_by(member)
++#endif
++#include <net/page_pool.h>
++#if IS_ENABLED(CONFIG_NET_MEDIATEK_SOC_WED)
++#error "This 5.15 port only supports PCIe without SoC WED"
++#endif
++struct mtk_wed_device { struct { unsigned int token_start; } wlan; };
++static inline bool mtk_wed_device_active(struct mtk_wed_device *wed) { return false; }
++static inline bool mtk_wed_get_rx_capa(struct mtk_wed_device *wed) { return false; }
++static inline void mtk_wed_device_detach(struct mtk_wed_device *wed) {}
++static inline u32 mtk_wed_device_reg_read(struct mtk_wed_device *wed, u32 reg) { return 0; }
++static inline void mtk_wed_device_reg_write(struct mtk_wed_device *wed, u32 reg, u32 val) {}
++static inline void mtk_wed_device_irq_set_mask(struct mtk_wed_device *wed, u32 mask) {}
++#ifndef IEEE80211_MLD_MAX_NUM_LINKS
++#define IEEE80211_MLD_MAX_NUM_LINKS 1
++#endif
++#endif
+--- a/src/dma.c
++++ b/src/dma.c
+@@ -8,14 +8,20 @@
+ #include "dma.h"
+ 
+ #if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 9, 0))
+-static inline void compat_init_dummy_netdev(struct net_device *dev)
+-{
+-	init_dummy_netdev(dev);
++static inline void compat_setup_napi_netdev(struct net_device *dev)
++{
++	/* alloc_netdev() already initialized address lists, references and
++	 * allocation padding. init_dummy_netdev() would memset them all
++	 * away on 5.15, making free_netdev() crash. Keep the device in
++	 * NETREG_UNINITIALIZED so allocation and release remain paired.
++	 */
++	set_bit(__LINK_STATE_PRESENT, &dev->state);
++	set_bit(__LINK_STATE_START, &dev->state);
+ }
+ 
+ #ifndef alloc_netdev_dummy
+ #define alloc_netdev_dummy(sizeof_priv) \
+-	alloc_netdev(sizeof_priv, "dummy", NET_NAME_UNKNOWN, compat_init_dummy_netdev)
++	alloc_netdev(sizeof_priv, "dummy", NET_NAME_UNKNOWN, compat_setup_napi_netdev)
+ #endif
+ #endif
+ 
+@@ -1066,7 +1072,7 @@
+ mt76_dma_rx_queue_init(struct mt76_dev *dev, enum mt76_rxq_id qid,
+ 		       int (*poll)(struct napi_struct *napi, int budget))
+ {
+-	netif_napi_add(dev->napi_dev, &dev->napi[qid], poll);
++	netif_napi_add(dev->napi_dev, &dev->napi[qid], poll, NAPI_POLL_WEIGHT);
+ 	mt76_dma_rx_fill_buf(dev, &dev->q_rx[qid], false);
+ 	napi_enable(&dev->napi[qid]);
+ }
+--- a/src/mac80211.c
++++ b/src/mac80211.c
+@@ -616,7 +616,7 @@
+ 	bool is_qrx = mt76_queue_is_rx(dev, q);
+ 	struct page_pool_params pp_params = {
+ 		.order = 0,
+-		.flags = 0,
++		.flags = PP_FLAG_PAGE_FRAG, /* required by the 5.15 fragment allocator */
+ 		.nid = NUMA_NO_NODE,
+ 		.dev = dev->dma_dev,
+ 	};
+@@ -644,8 +644,7 @@
+ 		pp_params.max_len = PAGE_SIZE;
+ 		pp_params.offset = 0;
+ 		/* NAPI is available just for rx queues */
+-		if (idx >= 0 && idx < ARRAY_SIZE(dev->napi))
+-			pp_params.napi = &dev->napi[idx];
++		/* 5.15 page pools do not store a NAPI pointer. */
+ 	}
+ 
+ 	q->page_pool = page_pool_create(&pp_params);
+@@ -861,19 +860,11 @@
+ struct mt76_phy *mt76_vif_phy(struct ieee80211_hw *hw,
+ 			      struct ieee80211_vif *vif)
+ {
+-	struct mt76_vif_link *mlink = (struct mt76_vif_link *)vif->drv_priv;
+-	struct mt76_chanctx *ctx;
+-
+-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0))
+-	if (!hw->wiphy->n_radio)
+-		return hw->priv;
+-#endif
+-
+-	if (!mlink->ctx)
+-		return NULL;
+-
+-	ctx = (struct mt76_chanctx *)mlink->ctx->drv_priv;
+-	return ctx->phy;
++	/* Linux 5.15 has no mac80211 multi-radio API. MT7902 uses one PHY.
++	 * Its private chanctx is mt792x_chanctx, not mt76_chanctx.
++	 * Reinterpreting it can return NULL or an unrelated pointer.
++	 */
++	return hw->priv;
+ }
+ EXPORT_SYMBOL_GPL(mt76_vif_phy);
+ 
+@@ -1251,14 +1242,9 @@
+ 	status->enc_flags = mstat.enc_flags;
+ 	status->encoding = mstat.encoding;
+ 	status->bw = mstat.bw;
+-	if (status->encoding == RX_ENC_EHT) {
+-		status->eht.ru = mstat.eht.ru;
+-		status->eht.gi = mstat.eht.gi;
+-	} else {
+-		status->he_ru = mstat.he_ru;
+-		status->he_gi = mstat.he_gi;
+-		status->he_dcm = mstat.he_dcm;
+-	}
++	status->he_ru = mstat.he_ru;
++	status->he_gi = mstat.he_gi;
++	status->he_dcm = mstat.he_dcm;
+ 	status->rate_idx = mstat.rate_idx;
+ 	status->nss = mstat.nss;
+ 	status->band = mstat.band;
+@@ -1281,10 +1267,6 @@
+ 	memcpy(status->chain_signal, mstat.chain_signal,
+ 	       sizeof(mstat.chain_signal));
+ 
+-	if (mstat.wcid) {
+-		status->link_valid = mstat.wcid->link_valid;
+-		status->link_id = mstat.wcid->link_id;
+-	}
+ 
+ 	*sta = wcid_to_sta(mstat.wcid);
+ 	*hw = mt76_phy_hw(dev, mstat.phy_idx);
+@@ -1850,10 +1832,10 @@
+ __mt76_csa_finish(void *priv, u8 *mac, struct ieee80211_vif *vif)
+ {
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 9, 0))
+-	if (vif->bss_conf.csa_active && ieee80211_beacon_cntdwn_is_complete(vif, 0))
++	if (vif->csa_active && ieee80211_beacon_cntdwn_is_complete(vif, 0))
+ 		ieee80211_csa_finish(vif, 0);
+ #else
+-	if (vif->bss_conf.csa_active && ieee80211_beacon_cntdwn_is_complete(vif))
++	if (vif->csa_active && ieee80211_beacon_cntdwn_is_complete(vif))
+ 		ieee80211_csa_finish(vif);
+ #endif
+ }
+@@ -1876,7 +1858,7 @@
+ {
+ 	struct mt76_dev *dev = priv;
+ 
+-	if (!vif->bss_conf.csa_active)
++	if (!vif->csa_active)
+ 		return;
+ 
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 9, 0))
+@@ -2100,56 +2082,7 @@
+ 
+ u16 mt76_select_links(struct ieee80211_vif *vif, int max_active_links)
+ {
+-	unsigned long usable_links = ieee80211_vif_usable_links(vif);
+-	struct  {
+-		u8 link_id;
+-		enum nl80211_band band;
+-	} data[IEEE80211_MLD_MAX_NUM_LINKS];
+-	unsigned int link_id;
+-	int i, n_data = 0;
+-	u16 sel_links = 0;
+-
+-	if (!ieee80211_vif_is_mld(vif))
+-		return 0;
+-
+-	if (vif->active_links == usable_links)
+-		return vif->active_links;
+-
+-	rcu_read_lock();
+-	for_each_set_bit(link_id, &usable_links, IEEE80211_MLD_MAX_NUM_LINKS) {
+-		struct ieee80211_bss_conf *link_conf;
+-
+-		link_conf = rcu_dereference(vif->link_conf[link_id]);
+-		if (WARN_ON_ONCE(!link_conf))
+-			continue;
+-
+-		data[n_data].link_id = link_id;
+-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 9, 0))
+-		data[n_data].band = link_conf->chanreq.oper.chan->band;
+-#else
+-		data[n_data].band = link_conf->chandef.chan->band;
+-#endif
+-		n_data++;
+-	}
+-	rcu_read_unlock();
+-
+-	for (i = 0; i < n_data; i++) {
+-		int j;
+-
+-		if (!(BIT(data[i].link_id) & vif->active_links))
+-			continue;
+-
+-		sel_links = BIT(data[i].link_id);
+-		for (j = 0; j < n_data; j++) {
+-			if (data[i].band != data[j].band) {
+-				sel_links |= BIT(data[j].link_id);
+-				if (hweight16(sel_links) == max_active_links)
+-					break;
+-			}
+-		}
+-		break;
+-	}
+-
+-	return sel_links;
++	/* MT7902 and Linux 5.15 use the default single link. */
++	return 0;
+ }
+ EXPORT_SYMBOL_GPL(mt76_select_links);
+--- a/src/mt76.h
++++ b/src/mt76.h
+@@ -14,9 +14,9 @@
+ #include <linux/usb.h>
+ #include <linux/average.h>
+ #include <linux/version.h>
+-#include <linux/soc/mediatek/mtk_wed.h>
++#include "compat515.h"
+ #include <net/mac80211.h>
+-#include <net/page_pool/helpers.h>
++
+ #include "util.h"
+ #include "testmode.h"
+ 
+@@ -1962,13 +1962,8 @@
+ mt76_vif_conf_link(struct mt76_dev *dev, struct ieee80211_vif *vif,
+ 		   struct ieee80211_bss_conf *link_conf)
+ {
+-	struct mt76_vif_link *mlink = (struct mt76_vif_link *)vif->drv_priv;
+-	struct mt76_vif_data *mvif = mlink->mvif;
+-
+-	if (link_conf == &vif->bss_conf || !link_conf->link_id)
+-		return mlink;
+-
+-	return mt76_dereference(mvif->link[link_conf->link_id], dev);
++	/* Linux 5.15 exposes one BSS configuration per interface. */
++	return (struct mt76_vif_link *)vif->drv_priv;
+ }
+ 
+ static inline struct mt76_phy *
+--- a/src/mt76_connac.h
++++ b/src/mt76_connac.h
+@@ -298,7 +298,6 @@
+ 		[NL80211_CHAN_WIDTH_10] = CMD_CBW_10MHZ,
+ 		[NL80211_CHAN_WIDTH_20] = CMD_CBW_20MHZ,
+ 		[NL80211_CHAN_WIDTH_20_NOHT] = CMD_CBW_20MHZ,
+-		[NL80211_CHAN_WIDTH_320] = CMD_CBW_320MHZ,
+ 	};
+ 
+ 	if (chandef->width >= ARRAY_SIZE(width_to_bw))
+--- a/src/mt76_connac_mac.c
++++ b/src/mt76_connac_mac.c
+@@ -305,7 +305,7 @@
+ 	if (!conf)
+ 		goto legacy;
+ 
+-	mvif = mt76_vif_conf_link(mphy->dev, conf->vif, conf);
++	mvif = mt76_vif_conf_link(mphy->dev, container_of(conf, struct ieee80211_vif, bss_conf), conf);
+ 	chandef = mvif->ctx ? &mvif->ctx->def : &mphy->chandef;
+ 	band = chandef->chan->band;
+ 
+@@ -635,16 +635,6 @@
+ 		stats->tx_retries +=
+ 			le32_get_bits(txs_data[7], MT_TXS7_MPDU_RETRY_CNT);
+ 
+-		if (wcid->sta) {
+-			struct ieee80211_sta *sta;
+-			u8 tid;
+-
+-			sta = container_of((void *)wcid, struct ieee80211_sta,
+-					   drv_priv);
+-			tid = FIELD_GET(MT_TXS0_TID, txs);
+-
+-			ieee80211_refresh_tx_agg_session_timer(sta, tid);
+-		}
+ 	}
+ 
+ 	txrate = FIELD_GET(MT_TXS0_TX_RATE, txs);
+@@ -1139,7 +1129,7 @@
+ 	u32 val;
+ 
+ 	if (!sta ||
+-	    !(sta->deflink.ht_cap.ht_supported || sta->deflink.he_cap.has_he))
++	    !(sta->ht_cap.ht_supported || sta->he_cap.has_he))
+ 		return;
+ 
+ 	tid = le32_get_bits(txwi[1], MT_TXD1_TID);
+--- a/src/mt76_connac_mcu.c
++++ b/src/mt76_connac_mcu.c
+@@ -198,7 +198,7 @@
+ 			      */
+ 	} req = {
+ 		.bss_idx = mvif->idx,
+-		.ps_state = vif->cfg.ps ? 2 : 0,
++		.ps_state = vif->bss_conf.ps ? 2 : 0,
+ 	};
+ 
+ 	if (vif->type != NL80211_IFTYPE_STATION)
+@@ -373,7 +373,7 @@
+ 				   struct ieee80211_link_sta *link_sta,
+ 				   int conn_state, bool newly)
+ {
+-	struct ieee80211_vif *vif = link_conf->vif;
++	struct ieee80211_vif *vif = container_of(link_conf, struct ieee80211_vif, bss_conf);
+ 	struct sta_rec_basic *basic;
+ 	struct tlv *tlv;
+ 	int conn_type;
+@@ -393,7 +393,7 @@
+ 		if (vif->type == NL80211_IFTYPE_STATION &&
+ 		    !is_zero_ether_addr(link_conf->bssid)) {
+ 			memcpy(basic->peer_addr, link_conf->bssid, ETH_ALEN);
+-			basic->aid = cpu_to_le16(vif->cfg.aid);
++			basic->aid = cpu_to_le16(vif->bss_conf.aid);
+ 		} else {
+ 			eth_broadcast_addr(basic->peer_addr);
+ 		}
+@@ -408,7 +408,7 @@
+ 		else
+ 			conn_type = CONNECTION_INFRA_STA;
+ 		basic->conn_type = cpu_to_le32(conn_type);
+-		basic->aid = cpu_to_le16(link_sta->sta->aid);
++		basic->aid = cpu_to_le16(link_sta->aid);
+ 		break;
+ 	case NL80211_IFTYPE_STATION:
+ 		if (vif->p2p && !is_connac2(dev))
+@@ -416,11 +416,11 @@
+ 		else
+ 			conn_type = CONNECTION_INFRA_AP;
+ 		basic->conn_type = cpu_to_le32(conn_type);
+-		basic->aid = cpu_to_le16(vif->cfg.aid);
++		basic->aid = cpu_to_le16(vif->bss_conf.aid);
+ 		break;
+ 	case NL80211_IFTYPE_ADHOC:
+ 		basic->conn_type = cpu_to_le32(CONNECTION_IBSS_ADHOC);
+-		basic->aid = cpu_to_le16(link_sta->sta->aid);
++		basic->aid = cpu_to_le16(link_sta->aid);
+ 		break;
+ 	default:
+ 		WARN_ON(1);
+@@ -428,7 +428,7 @@
+ 	}
+ 
+ 	memcpy(basic->peer_addr, link_sta->addr, ETH_ALEN);
+-	basic->qos = link_sta->sta->wme;
++	basic->qos = link_sta->wme;
+ }
+ EXPORT_SYMBOL_GPL(mt76_connac_mcu_sta_basic_tlv);
+ 
+@@ -560,7 +560,7 @@
+ 
+ 	if (sta) {
+ 		if (vif->type == NL80211_IFTYPE_STATION)
+-			generic->partial_aid = cpu_to_le16(vif->cfg.aid);
++			generic->partial_aid = cpu_to_le16(vif->bss_conf.aid);
+ 		else
+ 			generic->partial_aid = cpu_to_le16(sta->aid);
+ 		memcpy(generic->peer_addr, sta->addr, ETH_ALEN);
+@@ -606,14 +606,14 @@
+ 	    vif->type != NL80211_IFTYPE_STATION)
+ 		return;
+ 
+-	if (!sta->deflink.agg.max_amsdu_len)
++	if (!sta->max_amsdu_len)
+ 		return;
+ 
+ 	tlv = mt76_connac_mcu_add_tlv(skb, STA_REC_HW_AMSDU, sizeof(*amsdu));
+ 	amsdu = (struct sta_rec_amsdu *)tlv;
+ 	amsdu->max_amsdu_num = 8;
+ 	amsdu->amsdu_en = true;
+-	amsdu->max_mpdu_size = sta->deflink.agg.max_amsdu_len >=
++	amsdu->max_mpdu_size = sta->max_amsdu_len >=
+ 			       IEEE80211_MAX_MPDU_LEN_VHT_7991;
+ 
+ 	wcid->amsdu = true;
+@@ -624,7 +624,7 @@
+ static void
+ mt76_connac_mcu_sta_he_tlv(struct sk_buff *skb, struct ieee80211_sta *sta)
+ {
+-	struct ieee80211_sta_he_cap *he_cap = &sta->deflink.he_cap;
++	struct ieee80211_sta_he_cap *he_cap = &sta->he_cap;
+ 	struct ieee80211_he_cap_elem *elem = &he_cap->he_cap_elem;
+ 	struct sta_rec_he *he;
+ 	struct tlv *tlv;
+@@ -712,7 +712,7 @@
+ 
+ 	he->he_cap = cpu_to_le32(cap);
+ 
+-	switch (sta->deflink.bandwidth) {
++	switch (sta->bandwidth) {
+ 	case IEEE80211_STA_RX_BW_160:
+ 		if (elem->phy_cap_info[0] &
+ 		    IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_80PLUS80_MHZ_IN_5G)
+@@ -757,7 +757,7 @@
+ void
+ mt76_connac_mcu_sta_he_tlv_v2(struct sk_buff *skb, struct ieee80211_sta *sta)
+ {
+-	struct ieee80211_sta_he_cap *he_cap = &sta->deflink.he_cap;
++	struct ieee80211_sta_he_cap *he_cap = &sta->he_cap;
+ 	struct ieee80211_he_cap_elem *elem = &he_cap->he_cap_elem;
+ 	struct sta_rec_he_v2 *he;
+ 	struct tlv *tlv;
+@@ -768,7 +768,7 @@
+ 	memcpy(he->he_phy_cap, elem->phy_cap_info, sizeof(he->he_phy_cap));
+ 	memcpy(he->he_mac_cap, elem->mac_cap_info, sizeof(he->he_mac_cap));
+ 
+-	switch (sta->deflink.bandwidth) {
++	switch (sta->bandwidth) {
+ 	case IEEE80211_STA_RX_BW_160:
+ 		if (elem->phy_cap_info[0] &
+ 		    IEEE80211_HE_PHY_CAP0_CHANNEL_WIDTH_SET_80PLUS80_MHZ_IN_5G)
+@@ -784,7 +784,7 @@
+ 		break;
+ 	}
+ 
+-	he->pkt_ext = IEEE80211_HE_PHY_CAP9_NOMINAL_PKT_PADDING_16US;
++	he->pkt_ext = IEEE80211_HE_PHY_CAP9_NOMIMAL_PKT_PADDING_16US;
+ }
+ EXPORT_SYMBOL_GPL(mt76_connac_mcu_sta_he_tlv_v2);
+ 
+@@ -796,14 +796,12 @@
+ 	struct ieee80211_sta_ht_cap *ht_cap;
+ 	struct ieee80211_sta_vht_cap *vht_cap;
+ 	const struct ieee80211_sta_he_cap *he_cap;
+-	const struct ieee80211_sta_eht_cap *eht_cap;
+ 	u8 mode = 0;
+ 
+ 	if (link_sta) {
+ 		ht_cap = &link_sta->ht_cap;
+ 		vht_cap = &link_sta->vht_cap;
+ 		he_cap = &link_sta->he_cap;
+-		eht_cap = &link_sta->eht_cap;
+ 	} else {
+ 		struct ieee80211_supported_band *sband;
+ 
+@@ -811,7 +809,6 @@
+ 		ht_cap = &sband->ht_cap;
+ 		vht_cap = &sband->vht_cap;
+ 		he_cap = ieee80211_get_he_iftype_cap(sband, vif->type);
+-		eht_cap = ieee80211_get_eht_iftype_cap(sband, vif->type);
+ 	}
+ 
+ 	if (band == NL80211_BAND_2GHZ) {
+@@ -823,8 +820,6 @@
+ 		if (he_cap && he_cap->has_he)
+ 			mode |= PHY_TYPE_BIT_HE;
+ 
+-		if (eht_cap && eht_cap->has_eht)
+-			mode |= PHY_TYPE_BIT_BE;
+ 	} else if (band == NL80211_BAND_5GHZ || band == NL80211_BAND_6GHZ) {
+ 		mode |= PHY_TYPE_BIT_OFDM;
+ 
+@@ -837,8 +832,6 @@
+ 		if (he_cap && he_cap->has_he)
+ 			mode |= PHY_TYPE_BIT_HE;
+ 
+-		if (eht_cap && eht_cap->has_eht)
+-			mode |= PHY_TYPE_BIT_BE;
+ 	}
+ 
+ 	return mode;
+@@ -862,25 +855,25 @@
+ 	u16 supp_rates;
+ 
+ 	/* starec ht */
+-	if (sta->deflink.ht_cap.ht_supported) {
++	if (sta->ht_cap.ht_supported) {
+ 		struct sta_rec_ht *ht;
+ 
+ 		tlv = mt76_connac_mcu_add_tlv(skb, STA_REC_HT, sizeof(*ht));
+ 		ht = (struct sta_rec_ht *)tlv;
+-		ht->ht_cap = cpu_to_le16(sta->deflink.ht_cap.cap);
++		ht->ht_cap = cpu_to_le16(sta->ht_cap.cap);
+ 	}
+ 
+ 	/* starec vht */
+-	if (sta->deflink.vht_cap.vht_supported) {
++	if (sta->vht_cap.vht_supported) {
+ 		struct sta_rec_vht *vht;
+ 		int len;
+ 
+ 		len = is_connac2(dev) ? sizeof(*vht) : sizeof(*vht) - 4;
+ 		tlv = mt76_connac_mcu_add_tlv(skb, STA_REC_VHT, len);
+ 		vht = (struct sta_rec_vht *)tlv;
+-		vht->vht_cap = cpu_to_le32(sta->deflink.vht_cap.cap);
+-		vht->vht_rx_mcs_map = sta->deflink.vht_cap.vht_mcs.rx_mcs_map;
+-		vht->vht_tx_mcs_map = sta->deflink.vht_cap.vht_mcs.tx_mcs_map;
++		vht->vht_cap = cpu_to_le32(sta->vht_cap.cap);
++		vht->vht_rx_mcs_map = sta->vht_cap.vht_mcs.rx_mcs_map;
++		vht->vht_tx_mcs_map = sta->vht_cap.vht_mcs.tx_mcs_map;
+ 	}
+ 
+ 	/* starec uapsd */
+@@ -889,11 +882,11 @@
+ 	if (!is_connac2(dev))
+ 		return;
+ 
+-	if (sta->deflink.ht_cap.ht_supported || sta->deflink.he_cap.has_he)
++	if (sta->ht_cap.ht_supported || sta->he_cap.has_he)
+ 		mt76_connac_mcu_sta_amsdu_tlv(skb, sta, vif);
+ 
+ 	/* starec he */
+-	if (sta->deflink.he_cap.has_he) {
++	if (sta->he_cap.has_he) {
+ 		mt76_connac_mcu_sta_he_tlv(skb, sta);
+ 		mt76_connac_mcu_sta_he_tlv_v2(skb, sta);
+ 		if (band == NL80211_BAND_6GHZ &&
+@@ -903,25 +896,25 @@
+ 			tlv = mt76_connac_mcu_add_tlv(skb, STA_REC_HE_6G,
+ 						      sizeof(*he_6g_capa));
+ 			he_6g_capa = (struct sta_rec_he_6g_capa *)tlv;
+-			he_6g_capa->capa = sta->deflink.he_6ghz_capa.capa;
++			he_6g_capa->capa = sta->he_6ghz_capa.capa;
+ 		}
+ 	}
+ 
+ 	tlv = mt76_connac_mcu_add_tlv(skb, STA_REC_PHY, sizeof(*phy));
+ 	phy = (struct sta_rec_phy *)tlv;
+ 	phy->phy_type = mt76_connac_get_phy_mode_v2(mphy, vif, band,
+-						    &sta->deflink);
++						    sta);
+ 	phy->basic_rate = cpu_to_le16((u16)vif->bss_conf.basic_rates);
+ 	phy->rcpi = rcpi;
+ 	phy->ampdu = FIELD_PREP(IEEE80211_HT_AMPDU_PARM_FACTOR,
+-				sta->deflink.ht_cap.ampdu_factor) |
++				sta->ht_cap.ampdu_factor) |
+ 		     FIELD_PREP(IEEE80211_HT_AMPDU_PARM_DENSITY,
+-				sta->deflink.ht_cap.ampdu_density);
++				sta->ht_cap.ampdu_density);
+ 
+ 	tlv = mt76_connac_mcu_add_tlv(skb, STA_REC_RA, sizeof(*ra_info));
+ 	ra_info = (struct sta_rec_ra_info *)tlv;
+ 
+-	supp_rates = sta->deflink.supp_rates[band];
++	supp_rates = sta->supp_rates[band];
+ 	if (band == NL80211_BAND_2GHZ)
+ 		supp_rates = FIELD_PREP(RA_LEGACY_OFDM, supp_rates >> 4) |
+ 			     FIELD_PREP(RA_LEGACY_CCK, supp_rates & 0xf);
+@@ -930,18 +923,18 @@
+ 
+ 	ra_info->legacy = cpu_to_le16(supp_rates);
+ 
+-	if (sta->deflink.ht_cap.ht_supported)
++	if (sta->ht_cap.ht_supported)
+ 		memcpy(ra_info->rx_mcs_bitmask,
+-		       sta->deflink.ht_cap.mcs.rx_mask,
++		       sta->ht_cap.mcs.rx_mask,
+ 		       HT_MCS_MASK_NUM);
+ 
+ 	tlv = mt76_connac_mcu_add_tlv(skb, STA_REC_STATE, sizeof(*state));
+ 	state = (struct sta_rec_state *)tlv;
+ 	state->state = sta_state;
+ 
+-	if (sta->deflink.vht_cap.vht_supported) {
+-		state->vht_opmode = sta->deflink.bandwidth;
+-		state->vht_opmode |= (sta->deflink.rx_nss - 1) <<
++	if (sta->vht_cap.vht_supported) {
++		state->vht_opmode = sta->bandwidth;
++		state->vht_opmode |= (sta->rx_nss - 1) <<
+ 			IEEE80211_OPMODE_NOTIF_RX_NSS_SHIFT;
+ 	}
+ }
+@@ -957,7 +950,7 @@
+ 	tlv = mt76_connac_mcu_add_nested_tlv(skb, WTBL_SMPS, sizeof(*smps),
+ 					     wtbl_tlv, sta_wtbl);
+ 	smps = (struct wtbl_smps *)tlv;
+-	smps->smps = (sta->deflink.smps_mode == IEEE80211_SMPS_DYNAMIC);
++	smps->smps = (sta->smps_mode == IEEE80211_SMPS_DYNAMIC);
+ }
+ EXPORT_SYMBOL_GPL(mt76_connac_mcu_wtbl_smps_tlv);
+ 
+@@ -969,27 +962,27 @@
+ 	struct tlv *tlv;
+ 	u32 flags = 0;
+ 
+-	if (sta->deflink.ht_cap.ht_supported || sta->deflink.he_6ghz_capa.capa) {
++	if (sta->ht_cap.ht_supported || sta->he_6ghz_capa.capa) {
+ 		tlv = mt76_connac_mcu_add_nested_tlv(skb, WTBL_HT, sizeof(*ht),
+ 						     wtbl_tlv, sta_wtbl);
+ 		ht = (struct wtbl_ht *)tlv;
+ 		ht->ldpc = ht_ldpc &&
+-			   !!(sta->deflink.ht_cap.cap & IEEE80211_HT_CAP_LDPC_CODING);
+-
+-		if (sta->deflink.ht_cap.ht_supported) {
+-			ht->af = sta->deflink.ht_cap.ampdu_factor;
+-			ht->mm = sta->deflink.ht_cap.ampdu_density;
++			   !!(sta->ht_cap.cap & IEEE80211_HT_CAP_LDPC_CODING);
++
++		if (sta->ht_cap.ht_supported) {
++			ht->af = sta->ht_cap.ampdu_factor;
++			ht->mm = sta->ht_cap.ampdu_density;
+ 		} else {
+-			ht->af = le16_get_bits(sta->deflink.he_6ghz_capa.capa,
++			ht->af = le16_get_bits(sta->he_6ghz_capa.capa,
+ 					       IEEE80211_HE_6GHZ_CAP_MAX_AMPDU_LEN_EXP);
+-			ht->mm = le16_get_bits(sta->deflink.he_6ghz_capa.capa,
++			ht->mm = le16_get_bits(sta->he_6ghz_capa.capa,
+ 					       IEEE80211_HE_6GHZ_CAP_MIN_MPDU_START);
+ 		}
+ 
+ 		ht->ht = true;
+ 	}
+ 
+-	if (sta->deflink.vht_cap.vht_supported || sta->deflink.he_6ghz_capa.capa) {
++	if (sta->vht_cap.vht_supported || sta->he_6ghz_capa.capa) {
+ 		struct wtbl_vht *vht;
+ 		u8 af;
+ 
+@@ -998,18 +991,18 @@
+ 						     sta_wtbl);
+ 		vht = (struct wtbl_vht *)tlv;
+ 		vht->ldpc = vht_ldpc &&
+-			    !!(sta->deflink.vht_cap.cap & IEEE80211_VHT_CAP_RXLDPC);
++			    !!(sta->vht_cap.cap & IEEE80211_VHT_CAP_RXLDPC);
+ 		vht->vht = true;
+ 
+ 		af = FIELD_GET(IEEE80211_VHT_CAP_MAX_A_MPDU_LENGTH_EXPONENT_MASK,
+-			       sta->deflink.vht_cap.cap);
++			       sta->vht_cap.cap);
+ 		if (ht)
+ 			ht->af = max(ht->af, af);
+ 	}
+ 
+ 	mt76_connac_mcu_wtbl_smps_tlv(skb, sta, sta_wtbl, wtbl_tlv);
+ 
+-	if (is_connac_v1(dev) && sta->deflink.ht_cap.ht_supported) {
++	if (is_connac_v1(dev) && sta->ht_cap.ht_supported) {
+ 		/* sgi */
+ 		u32 msk = MT_WTBL_W5_SHORT_GI_20 | MT_WTBL_W5_SHORT_GI_40 |
+ 			  MT_WTBL_W5_SHORT_GI_80 | MT_WTBL_W5_SHORT_GI_160;
+@@ -1019,15 +1012,15 @@
+ 						     sizeof(*raw), wtbl_tlv,
+ 						     sta_wtbl);
+ 
+-		if (sta->deflink.ht_cap.cap & IEEE80211_HT_CAP_SGI_20)
++		if (sta->ht_cap.cap & IEEE80211_HT_CAP_SGI_20)
+ 			flags |= MT_WTBL_W5_SHORT_GI_20;
+-		if (sta->deflink.ht_cap.cap & IEEE80211_HT_CAP_SGI_40)
++		if (sta->ht_cap.cap & IEEE80211_HT_CAP_SGI_40)
+ 			flags |= MT_WTBL_W5_SHORT_GI_40;
+ 
+-		if (sta->deflink.vht_cap.vht_supported) {
+-			if (sta->deflink.vht_cap.cap & IEEE80211_VHT_CAP_SHORT_GI_80)
++		if (sta->vht_cap.vht_supported) {
++			if (sta->vht_cap.cap & IEEE80211_VHT_CAP_SHORT_GI_80)
+ 				flags |= MT_WTBL_W5_SHORT_GI_80;
+-			if (sta->deflink.vht_cap.cap & IEEE80211_VHT_CAP_SHORT_GI_160)
++			if (sta->vht_cap.cap & IEEE80211_VHT_CAP_SHORT_GI_160)
+ 				flags |= MT_WTBL_W5_SHORT_GI_160;
+ 		}
+ 		raw = (struct wtbl_raw *)tlv;
+@@ -1059,7 +1052,7 @@
+ 
+ 	conn_state = info->enable ? CONN_STATE_PORT_SECURE :
+ 				    CONN_STATE_DISCONNECT;
+-	link_sta = info->sta ? &info->sta->deflink : NULL;
++	link_sta = info->sta ? info->sta : NULL;
+ 	if (info->sta || !info->offload_fw)
+ 		mt76_connac_mcu_sta_basic_tlv(dev, skb, info->link_conf,
+ 					      link_sta, conn_state,
+@@ -1197,7 +1190,7 @@
+ 	int err, idx, cmd, len;
+ 	void *data;
+ 
+-	switch (bss_conf->vif->type) {
++	switch (container_of(bss_conf, struct ieee80211_vif, bss_conf)->type) {
+ 	case NL80211_IFTYPE_MESH_POINT:
+ 	case NL80211_IFTYPE_MONITOR:
+ 	case NL80211_IFTYPE_AP:
+@@ -1220,7 +1213,7 @@
+ 	idx = mvif->omac_idx > EXT_BSSID_START ? HW_BSSID_0 : mvif->omac_idx;
+ 	basic_req.basic.hw_bss_idx = idx;
+ 
+-	memcpy(dev_req.tlv.omac_addr, bss_conf->addr, ETH_ALEN);
++	memcpy(dev_req.tlv.omac_addr, container_of(bss_conf, struct ieee80211_vif, bss_conf)->addr, ETH_ALEN);
+ 
+ 	cmd = enable ? MCU_UNI_CMD(DEV_INFO_UPDATE) : MCU_UNI_CMD(BSS_INFO_UPDATE);
+ 	data = enable ? (void *)&dev_req : (void *)&basic_req;
+@@ -1259,14 +1252,7 @@
+ 
+ int mt76_connac_mcu_sta_wed_update(struct mt76_dev *dev, struct sk_buff *skb)
+ {
+-	if (!mt76_is_mmio(dev))
+-		return 0;
+-
+-	if (!mtk_wed_device_active(&dev->mmio.wed))
+-		return 0;
+-
+-	return mtk_wed_device_update_msg(&dev->mmio.wed, WED_WO_STA_REC,
+-					 skb->data, skb->len);
++	return 0; /* PCIe MT7902 has no WED offload. */
+ }
+ EXPORT_SYMBOL_GPL(mt76_connac_mcu_sta_wed_update);
+ 
+@@ -1378,34 +1364,7 @@
+ u8 mt76_connac_get_phy_mode_ext(struct mt76_phy *phy, struct ieee80211_bss_conf *conf,
+ 				enum nl80211_band band)
+ {
+-	const struct ieee80211_sta_eht_cap *eht_cap;
+-	struct ieee80211_supported_band *sband;
+-	u8 mode = 0;
+-
+-	if (band == NL80211_BAND_6GHZ)
+-		mode |= PHY_MODE_AX_6G;
+-
+-	sband = phy->hw->wiphy->bands[band];
+-	eht_cap = ieee80211_get_eht_iftype_cap(sband, conf->vif->type);
+-
+-	if (!eht_cap || !eht_cap->has_eht || !conf->eht_support)
+-		return mode;
+-
+-	switch (band) {
+-	case NL80211_BAND_6GHZ:
+-		mode |= PHY_MODE_BE_6G;
+-		break;
+-	case NL80211_BAND_5GHZ:
+-		mode |= PHY_MODE_BE_5G;
+-		break;
+-	case NL80211_BAND_2GHZ:
+-		mode |= PHY_MODE_BE_24G;
+-		break;
+-	default:
+-		break;
+-	}
+-
+-	return mode;
++	return band == NL80211_BAND_6GHZ ? PHY_MODE_AX_6G : 0;
+ }
+ EXPORT_SYMBOL_GPL(mt76_connac_get_phy_mode_ext);
+ 
+@@ -1427,12 +1386,7 @@
+ const struct ieee80211_sta_eht_cap *
+ mt76_connac_get_eht_phy_cap(struct mt76_phy *phy, struct ieee80211_vif *vif)
+ {
+-	enum nl80211_band band = phy->chandef.chan->band;
+-	struct ieee80211_supported_band *sband;
+-
+-	sband = phy->hw->wiphy->bands[band];
+-
+-	return ieee80211_get_eht_iftype_cap(sband, vif->type);
++	return NULL; /* MT7902 is HE, not EHT. */
+ }
+ EXPORT_SYMBOL_GPL(mt76_connac_get_eht_phy_cap);
+ 
+@@ -2309,7 +2263,7 @@
+ 	struct ieee80211_vif *mvif = container_of(info, struct ieee80211_vif,
+ 						  bss_conf);
+ 	struct sk_buff *skb;
+-	int i, len = min_t(int, mvif->cfg.arp_addr_cnt,
++	int i, len = min_t(int, mvif->bss_conf.arp_addr_cnt,
+ 			   IEEE80211_BSS_ARP_ADDR_LIST_LEN);
+ 	struct {
+ 		struct {
+@@ -2337,7 +2291,7 @@
+ 
+ 	skb_put_data(skb, &req_hdr, sizeof(req_hdr));
+ 	for (i = 0; i < len; i++)
+-		skb_put_data(skb, &mvif->cfg.arp_addr_list[i], sizeof(__be32));
++		skb_put_data(skb, &mvif->bss_conf.arp_addr_list[i], sizeof(__be32));
+ 
+ 	return mt76_mcu_skb_send_msg(dev, skb, MCU_UNI_CMD(OFFLOAD), true);
+ }
+@@ -2846,9 +2800,9 @@
+ 	case NL80211_IFTYPE_AP:
+ 		if (ieee80211_hw_check(phy->hw, SUPPORTS_MULTI_BSSID)) {
+ 			u8 bssid_id = vif->bss_conf.bssid_indicator;
+-			struct wiphy *wiphy = phy->hw->wiphy;
+-
+-			if (bssid_id > ilog2(wiphy->mbssid_max_interfaces))
++			
++
++			if (bssid_id > 0) /* no multi-BSSID AP in this port */
+ 				return -EINVAL;
+ 
+ 			bss->non_tx_bssid = vif->bss_conf.bssid_index;
+--- a/src/mt7902/main.c
++++ b/src/mt7902/main.c
+@@ -157,8 +157,7 @@
+ 			mt76_connac_gen_ppe_thresh(he_cap->ppe_thres, nss, band);
+ 		} else {
+ 			he_cap_elem->phy_cap_info[9] |=
+-				u8_encode_bits(IEEE80211_HE_PHY_CAP9_NOMINAL_PKT_PADDING_16US,
+-					       IEEE80211_HE_PHY_CAP9_NOMINAL_PKT_PADDING_MASK);
++				IEEE80211_HE_PHY_CAP9_NOMIMAL_PKT_PADDING_16US;
+ 		}
+ 
+ 		if (band == NL80211_BAND_6GHZ) {
+@@ -574,7 +573,7 @@
+ 		 * reassociating. But we should trigger the deletion process
+ 		 * to avoid using incorrect cipher after disconnection,
+ 		 */
+-		if (vif->type != NL80211_IFTYPE_STATION || vif->cfg.assoc)
++		if (vif->type != NL80211_IFTYPE_STATION || vif->bss_conf.assoc)
+ 			goto out;
+ 	}
+ 
+@@ -718,7 +717,7 @@
+ static void mt7921_bss_info_changed(struct ieee80211_hw *hw,
+ 				    struct ieee80211_vif *vif,
+ 				    struct ieee80211_bss_conf *info,
+-				    u64 changed)
++				    u32 changed)
+ {
+ 	struct mt792x_phy *phy = mt792x_hw_phy(hw);
+ 	struct mt792x_dev *dev = mt792x_hw_dev(hw);
+@@ -752,7 +751,7 @@
+ 	if (changed & BSS_CHANGED_ASSOC) {
+ 		mt7921_mcu_sta_update(dev, NULL, vif, true,
+ 				      MT76_STA_INFO_STATE_ASSOC);
+-		mt7921_mcu_set_beacon_filter(dev, vif, vif->cfg.assoc);
++		mt7921_mcu_set_beacon_filter(dev, vif, vif->bss_conf.assoc);
+ 	}
+ 
+ 	if (changed & BSS_CHANGED_ARP_FILTER) {
+@@ -766,70 +765,9 @@
+ }
+ 
+ static void
+-mt7921_calc_vif_num(void *priv, u8 *mac, struct ieee80211_vif *vif)
+-{
+-	u32 *num = priv;
+-
+-	if (!priv)
+-		return;
+-
+-	switch (vif->type) {
+-	case NL80211_IFTYPE_STATION:
+-	case NL80211_IFTYPE_P2P_CLIENT:
+-	case NL80211_IFTYPE_AP:
+-	case NL80211_IFTYPE_P2P_GO:
+-		*num += 1;
+-		break;
+-	default:
+-		break;
+-	}
+-}
+-
+-static void
+ mt7921_regd_set_6ghz_power_type(struct ieee80211_vif *vif, bool is_add)
+ {
+-	struct mt792x_vif *mvif = (struct mt792x_vif *)vif->drv_priv;
+-	struct mt792x_phy *phy = mvif->phy;
+-	struct mt792x_dev *dev = phy->dev;
+-	u32 valid_vif_num = 0;
+-
+-	ieee80211_iterate_active_interfaces(mt76_hw(dev),
+-					    IEEE80211_IFACE_ITER_RESUME_ALL,
+-					    mt7921_calc_vif_num, &valid_vif_num);
+-
+-	if (valid_vif_num > 1) {
+-		phy->power_type = MT_AP_DEFAULT;
+-		goto out;
+-	}
+-
+-	if (!is_add)
+-		vif->bss_conf.power_type = IEEE80211_REG_UNSET_AP;
+-
+-	switch (vif->bss_conf.power_type) {
+-	case IEEE80211_REG_SP_AP:
+-		phy->power_type = MT_AP_SP;
+-		break;
+-	case IEEE80211_REG_VLP_AP:
+-		phy->power_type = MT_AP_VLP;
+-		break;
+-	case IEEE80211_REG_LPI_AP:
+-		phy->power_type = MT_AP_LPI;
+-		break;
+-	case IEEE80211_REG_UNSET_AP:
+-		phy->power_type = MT_AP_UNSET;
+-		break;
+-	default:
+-		phy->power_type = MT_AP_DEFAULT;
+-		break;
+-	}
+-
+-out:
+-#if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 9, 0))
+-	if (vif->bss_conf.chanreq.oper.chan->band == NL80211_BAND_6GHZ)
+-#else
+-	if (vif->bss_conf.chandef.chan->band == NL80211_BAND_6GHZ)
+-#endif
+-		mt7921_regd_update(dev);
++	/* 5.15 lacks 6 GHz AP power-type information. The port exposes only 2.4/5 GHz. */
+ }
+ 
+ int mt7921_mac_sta_add(struct mt76_dev *mdev, struct ieee80211_vif *vif,
+@@ -1353,8 +1291,7 @@
+ }
+ 
+ static int
+-mt7921_start_ap(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+-		struct ieee80211_bss_conf *link_conf)
++mt7921_start_ap(struct ieee80211_hw *hw, struct ieee80211_vif *vif)
+ {
+ 	struct mt792x_vif *mvif = (struct mt792x_vif *)vif->drv_priv;
+ 	struct mt792x_phy *phy = mt792x_hw_phy(hw);
+@@ -1381,8 +1318,7 @@
+ }
+ 
+ static void
+-mt7921_stop_ap(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+-	       struct ieee80211_bss_conf *link_conf)
++mt7921_stop_ap(struct ieee80211_hw *hw, struct ieee80211_vif *vif)
+ {
+ 	struct mt792x_vif *mvif = (struct mt792x_vif *)vif->drv_priv;
+ 	struct mt792x_phy *phy = mt792x_hw_phy(hw);
+@@ -1475,7 +1411,7 @@
+ 				     int n_vifs,
+ 				     enum ieee80211_chanctx_switch_mode mode)
+ {
+-	return mt792x_assign_vif_chanctx(hw, vifs->vif, vifs->link_conf,
++	return mt792x_assign_vif_chanctx(hw, vifs->vif, &vifs->vif->bss_conf,
+ 					 vifs->new_ctx);
+ }
+ 
+@@ -1507,7 +1443,7 @@
+ 				     struct ieee80211_vif *vif,
+ 				     struct ieee80211_channel_switch *chsw)
+ {
+-	if (vif->type != NL80211_IFTYPE_STATION || !vif->cfg.assoc)
++	if (vif->type != NL80211_IFTYPE_STATION || !vif->bss_conf.assoc)
+ 		return -EOPNOTSUPP;
+ 
+ 	if (!cfg80211_chandef_usable(hw->wiphy, &chsw->chandef,
+@@ -1570,6 +1506,23 @@
+ 	wiphy_rfkill_set_hw_state(hw->wiphy, ret ? false : true);
+ }
+ 
++/* Adapt 5.15 callback signatures to the single-link internal implementation. */
++static int mt7902_conf_tx_515(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
++                            u16 queue, const struct ieee80211_tx_queue_params *params)
++{
++ return mt792x_conf_tx(hw, vif, 0, queue, params);
++}
++static int mt7902_assign_chanctx_515(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
++                                   struct ieee80211_chanctx_conf *ctx)
++{
++ return mt792x_assign_vif_chanctx(hw, vif, &vif->bss_conf, ctx);
++}
++static void mt7902_unassign_chanctx_515(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
++                                      struct ieee80211_chanctx_conf *ctx)
++{
++ mt792x_unassign_vif_chanctx(hw, vif, &vif->bss_conf, ctx);
++}
++
+ const struct ieee80211_ops mt7921_ops = {
+ 	.tx = mt792x_tx,
+ 	.start = mt7921_start,
+@@ -1577,7 +1530,7 @@
+ 	.add_interface = mt7921_add_interface,
+ 	.remove_interface = mt792x_remove_interface,
+ 	.config = mt7921_config,
+-	.conf_tx = mt792x_conf_tx,
++	.conf_tx = mt7902_conf_tx_515,
+ 	.configure_filter = mt7921_configure_filter,
+ 	.bss_info_changed = mt7921_bss_info_changed,
+ 	.start_ap = mt7921_start_ap,
+@@ -1626,8 +1579,8 @@
+ 	.add_chanctx = mt7921_add_chanctx,
+ 	.remove_chanctx = mt7921_remove_chanctx,
+ 	.change_chanctx = mt7921_change_chanctx,
+-	.assign_vif_chanctx = mt792x_assign_vif_chanctx,
+-	.unassign_vif_chanctx = mt792x_unassign_vif_chanctx,
++	.assign_vif_chanctx = mt7902_assign_chanctx_515,
++	.unassign_vif_chanctx = mt7902_unassign_chanctx_515,
+ 	.mgd_prepare_tx = mt7921_mgd_prepare_tx,
+ 	.mgd_complete_tx = mt7921_mgd_complete_tx,
+ 	.switch_vif_chanctx = mt7921_switch_vif_chanctx,
+--- a/src/mt7902/mcu.c
++++ b/src/mt7902/mcu.c
+@@ -594,7 +594,7 @@
+ 
+ 		switch (le32_to_cpu(tlv->type)) {
+ 		case MT_NIC_CAP_6G:
+-			phy->cap.has_6ghz = skb->data[0];
++			phy->cap.has_6ghz = false; /* 5.15 port: 2.4/5 GHz only */
+ 			break;
+ 		case MT_NIC_CAP_MAC_ADDR:
+ 			memcpy(phy->macaddr, (void *)skb->data, ETH_ALEN);
+@@ -961,7 +961,7 @@
+ 		.ps = {
+ 			.tag = cpu_to_le16(UNI_BSS_INFO_PS),
+ 			.len = cpu_to_le16(sizeof(struct ps_tlv)),
+-			.ps_state = vif->cfg.ps ? 2 : 0,
++			.ps_state = vif->bss_conf.ps ? 2 : 0,
+ 		},
+ 	};
+ 
+@@ -1025,7 +1025,7 @@
+ 		u8 pad;
+ 	} req = {
+ 		.bss_idx = mvif->bss_conf.mt76.idx,
+-		.aid = cpu_to_le16(vif->cfg.aid),
++		.aid = cpu_to_le16(vif->bss_conf.aid),
+ 		.dtim_period = vif->bss_conf.dtim_period,
+ 		.bcn_interval = cpu_to_le16(vif->bss_conf.beacon_int),
+ 	};
+@@ -1177,7 +1177,6 @@
+ 		[NL80211_CHAN_WIDTH_80P80] = 3,
+ 		[NL80211_CHAN_WIDTH_5] = 4,
+ 		[NL80211_CHAN_WIDTH_10] = 5,
+-		[NL80211_CHAN_WIDTH_320] = 6,
+ 	};
+ 	struct {
+ 		struct {
+@@ -1276,7 +1275,7 @@
+ 	if (!enable)
+ 		return -EOPNOTSUPP;
+ 
+-	skb = ieee80211_beacon_get_template(mt76_hw(dev), vif, &offs, 0);
++	skb = ieee80211_beacon_get_template(mt76_hw(dev), vif, &offs);
+ 	if (!skb)
+ 		return -EINVAL;
+ 
+@@ -1484,7 +1483,7 @@
+ 		u16 duration;
+ 		u8 rsv2[2];
+ 	} __packed data = {
+-		.enable = vif->cfg.assoc,
++		.enable = vif->bss_conf.assoc,
+ 		.cqm_rssi_high = vif->bss_conf.cqm_rssi_thold + vif->bss_conf.cqm_rssi_hyst,
+ 		.cqm_rssi_low = vif->bss_conf.cqm_rssi_thold - vif->bss_conf.cqm_rssi_hyst,
+ 		.bss_idx = mvif->bss_conf.mt76.idx,
+--- a/src/mt7902/pci.c
++++ b/src/mt7902/pci.c
+@@ -255,8 +255,8 @@
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	netif_napi_add_tx(dev->mt76.tx_napi_dev, &dev->mt76.tx_napi,
+-			  mt792x_poll_tx);
++	netif_tx_napi_add(dev->mt76.tx_napi_dev, &dev->mt76.tx_napi,
++			  mt792x_poll_tx, NAPI_POLL_WEIGHT);
+ 	napi_enable(&dev->mt76.tx_napi);
+ 
+ 	return mt792x_dma_enable(dev);
+@@ -622,5 +622,6 @@
+ MODULE_FIRMWARE(MT7902_ROM_PATCH);
+ MODULE_AUTHOR("Sean Wang <sean.wang@mediatek.com>");
+ MODULE_AUTHOR("Lorenzo Bianconi <lorenzo@kernel.org>");
+-MODULE_DESCRIPTION("MediaTek MT7921E (PCIe) wireless driver");
++MODULE_DESCRIPTION("Experimental MT7902 PCIe port for Ubuntu 20.04 Linux 5.15");
++MODULE_VERSION("0.3-linux515");
+ MODULE_LICENSE("Dual BSD/GPL");
+--- a/src/mt792x.h
++++ b/src/mt792x.h
+@@ -266,64 +266,34 @@
+ static inline struct mt792x_bss_conf *
+ mt792x_vif_to_link(struct mt792x_vif *mvif, u8 link_id)
+ {
+-	struct ieee80211_vif *vif;
+-	struct mt792x_bss_conf *bss_conf;
+-
+-	vif = container_of((void *)mvif, struct ieee80211_vif, drv_priv);
+-
+-	if (!ieee80211_vif_is_mld(vif) ||
+-	    link_id >= IEEE80211_LINK_UNSPECIFIED)
+-		return &mvif->bss_conf;
+-
+-	bss_conf = rcu_dereference_protected(mvif->link_conf[link_id],
+-					     lockdep_is_held(&mvif->phy->dev->mt76.mutex));
+-
+-	return bss_conf ? bss_conf : &mvif->bss_conf;
++	return &mvif->bss_conf;
+ }
+ 
+ static inline struct mt792x_link_sta *
+ mt792x_sta_to_link(struct mt792x_sta *msta, u8 link_id)
+ {
+-	struct ieee80211_vif *vif;
+-
+-	vif = container_of((void *)msta->vif, struct ieee80211_vif, drv_priv);
+-
+-	if (!ieee80211_vif_is_mld(vif) ||
+-	    link_id >= IEEE80211_LINK_UNSPECIFIED)
+-		return &msta->deflink;
+-
+-	return rcu_dereference_protected(msta->link[link_id],
+-		lockdep_is_held(&msta->vif->phy->dev->mt76.mutex));
++	return &msta->deflink;
+ }
+ 
+ static inline struct mt792x_bss_conf *
+ mt792x_link_conf_to_mconf(struct ieee80211_bss_conf *link_conf)
+ {
+-	struct ieee80211_vif *vif = link_conf->vif;
++	struct ieee80211_vif *vif = container_of(link_conf, struct ieee80211_vif, bss_conf);
+ 	struct mt792x_vif *mvif = (struct mt792x_vif *)vif->drv_priv;
+-
+-	return mt792x_vif_to_link(mvif, link_conf->link_id);
++	return &mvif->bss_conf;
+ }
+ 
+ static inline struct ieee80211_bss_conf *
+ mt792x_vif_to_bss_conf(struct ieee80211_vif *vif, unsigned int link_id)
+ {
+-	if (!ieee80211_vif_is_mld(vif) ||
+-	    link_id >= IEEE80211_LINK_UNSPECIFIED)
+-		return &vif->bss_conf;
+-
+-	return link_conf_dereference_protected(vif, link_id);
++	return &vif->bss_conf;
+ }
+ 
+ static inline struct ieee80211_link_sta *
+ mt792x_sta_to_link_sta(struct ieee80211_vif *vif, struct ieee80211_sta *sta,
+ 		       unsigned int link_id)
+ {
+-	if (!ieee80211_vif_is_mld(vif) ||
+-	    link_id >= IEEE80211_LINK_UNSPECIFIED)
+-		return &sta->deflink;
+-
+-	return link_sta_dereference_protected(sta, link_id);
++	return sta;
+ }
+ 
+ static inline struct mt792x_dev *
+--- a/src/mt792x_core.c
++++ b/src/mt792x_core.c
+@@ -91,8 +91,7 @@
+ 	if (control->sta) {
+ 		struct mt792x_link_sta *mlink;
+ 		struct mt792x_sta *sta;
+-		link_id = u32_get_bits(info->control.flags,
+-				       IEEE80211_TX_CTRL_MLO_LINK);
++		link_id = 0;
+ 		sta = (struct mt792x_sta *)control->sta->drv_priv;
+ 		mlink = mt792x_sta_to_link(sta, link_id);
+ 		wcid = &mlink->wcid;
+@@ -103,24 +102,6 @@
+ 
+ 		mvif = (struct mt792x_vif *)vif->drv_priv;
+ 		wcid = &mvif->sta.deflink.wcid;
+-	}
+-
+-	if (vif && control->sta && ieee80211_vif_is_mld(vif)) {
+-		struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
+-		struct ieee80211_link_sta *link_sta;
+-		struct ieee80211_bss_conf *conf;
+-
+-		link_id = wcid->link_id;
+-		rcu_read_lock();
+-		conf = rcu_dereference(vif->link_conf[link_id]);
+-		memcpy(hdr->addr2, conf->addr, ETH_ALEN);
+-
+-		link_sta = rcu_dereference(control->sta->link[link_id]);
+-		memcpy(hdr->addr1, link_sta->addr, ETH_ALEN);
+-
+-		if (vif->type == NL80211_IFTYPE_STATION)
+-			memcpy(hdr->addr3, conf->bssid, ETH_ALEN);
+-		rcu_read_unlock();
+ 	}
+ 
+ 	if (mt76_connac_pm_ref(mphy, &dev->pm)) {
+@@ -369,7 +350,7 @@
+ 	mvif->bss_conf.mt76.ctx = NULL;
+ 	mutex_unlock(&dev->mt76.mutex);
+ 
+-	if (vif->bss_conf.csa_active) {
++	if (vif->csa_active) {
+ 		timer_delete_sync(&mvif->csa_timer);
+ 		cancel_work_sync(&mvif->csa_work);
+ 	}
+@@ -474,7 +455,7 @@
+ 	memcpy(data, mt792x_gstrings_stats, sizeof(mt792x_gstrings_stats));
+ 
+ 	data += sizeof(mt792x_gstrings_stats);
+-	page_pool_ethtool_stats_get_strings(data);
++	/* page-pool ethtool statistics are unavailable on 5.15. */
+ }
+ EXPORT_SYMBOL_GPL(mt792x_get_et_strings);
+ 
+@@ -485,7 +466,7 @@
+ 		return 0;
+ 
+ 	return ARRAY_SIZE(mt792x_gstrings_stats) +
+-	       page_pool_ethtool_stats_get_count();
++	       0;
+ }
+ EXPORT_SYMBOL_GPL(mt792x_get_et_sset_count);
+ 
+@@ -563,7 +544,7 @@
+ 	ei += wi.worker_stat_count;
+ 
+ 	mt76_ethtool_page_pool_stats(&dev->mt76, &data[ei], &ei);
+-	stats_size += page_pool_ethtool_stats_get_count();
++	stats_size += 0;
+ 
+ 	if (ei != stats_size)
+ 		dev_err(dev->mt76.dev, "ei: %d  SSTATS_LEN: %d", ei,
+--- a/src/scan.c
++++ b/src/scan.c
+@@ -71,7 +71,8 @@
+ 	info = IEEE80211_SKB_CB(skb);
+ 	if (req->no_cck)
+ 		info->flags |= IEEE80211_TX_CTL_NO_CCK_RATE;
+-	info->control.flags |= IEEE80211_TX_CTRL_DONT_USE_RATE_MASK;
++	/* Route scan probes through the 5.15 off-channel transmit queue. */
++	info->flags |= IEEE80211_TX_CTL_TX_OFFCHAN;
+ 
+ 	mt76_tx(phy, NULL, mvif->wcid, skb);
+ 
+--- a/src/tx.c
++++ b/src/tx.c
+@@ -60,7 +60,6 @@
+ 			.skb = skb,
+ 			.info = IEEE80211_SKB_CB(skb),
+ 		};
+-		struct ieee80211_rate_status rs = {};
+ 		struct mt76_tx_cb *cb = mt76_tx_skb_cb(skb);
+ 		struct mt76_wcid *wcid;
+ 
+@@ -68,11 +67,9 @@
+ 		if (wcid) {
+ 			status.sta = wcid_to_sta(wcid);
+ 			if (status.sta && (wcid->rate.flags || wcid->rate.legacy)) {
+-				rs.rate_idx = wcid->rate;
+-				status.rates = &rs;
+-				status.n_rates = 1;
++				status.rate = &wcid->rate;
+ 			} else {
+-				status.n_rates = 0;
++				status.rate = NULL;
+ 			}
+ 		}
+ 
+@@ -282,14 +279,11 @@
+ #endif
+ 
+ 	if (cb->pktid < MT_PACKET_ID_FIRST) {
+-		struct ieee80211_rate_status rs = {};
+ 
+ 		hw = mt76_tx_status_get_hw(dev, skb);
+ 		status.sta = wcid_to_sta(wcid);
+ 		if (status.sta && (wcid->rate.flags || wcid->rate.legacy)) {
+-			rs.rate_idx = wcid->rate;
+-			status.rates = &rs;
+-			status.n_rates = 1;
++			status.rate = &wcid->rate;
+ 		}
+ 		spin_lock_bh(&dev->rx_lock);
+ 		ieee80211_tx_status_ext(hw, &status);
+@@ -345,7 +339,6 @@
+ 	struct mt76_wcid *wcid, struct sk_buff *skb)
+ {
+ 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+-	struct ieee80211_hdr *hdr = (void *)skb->data;
+ 	struct sk_buff_head *head;
+ 
+ 	if (mt76_testmode_enabled(phy)) {
+@@ -362,9 +355,7 @@
+ 
+ 	info->hw_queue |= FIELD_PREP(MT_TX_HW_QUEUE_PHY, phy->band_idx);
+ 
+-	if ((info->flags & IEEE80211_TX_CTL_TX_OFFCHAN) ||
+-	    ((info->control.flags & IEEE80211_TX_CTRL_DONT_USE_RATE_MASK) &&
+-	     ieee80211_is_probe_req(hdr->frame_control)))
++	if (info->flags & IEEE80211_TX_CTL_TX_OFFCHAN)
+ 		head = &wcid->tx_offchannel;
+ 	else
+ 		head = &wcid->tx_pending;
+@@ -633,7 +624,7 @@
+ 		if ((dev->drv->drv_flags & MT_DRV_HW_MGMT_TXQ) &&
+ 		    !(info->flags & IEEE80211_TX_CTL_HW_80211_ENCAP) &&
+ 		    !ieee80211_is_data(hdr->frame_control) &&
+-		    (!ieee80211_is_bufferable_mmpdu(skb) ||
++		    (!ieee80211_is_bufferable_mmpdu(hdr->frame_control) ||
+ 		     ieee80211_is_deauth(hdr->frame_control) ||
+ 		     head == &wcid->tx_offchannel))
+ 			qid = MT_TXQ_PSD;
+--- a/src/wed.c
++++ b/src/wed.c
+@@ -190,7 +190,7 @@
+ 	if (!mtk_wed_device_active(wed))
+ 		return -EOPNOTSUPP;
+ 
+-	return mtk_wed_device_setup_tc(wed, netdev, type, type_data);
++	return -EOPNOTSUPP; /* no SoC WED engine on this PCIe target */
+ }
+ EXPORT_SYMBOL_GPL(mt76_wed_net_setup_tc);
+ 
+--- a/dkms.conf
++++ b/dkms.conf
+@@ -1,6 +1,6 @@
+ PACKAGE_NAME="mt7902e"
+-PACKAGE_VERSION="git"
++PACKAGE_VERSION="0.3-linux515"
+ MAKE[0]="make KVER=$kernelver"
+ BUILT_MODULE_NAME[0]=$PACKAGE_NAME
+ DEST_MODULE_LOCATION[0]="/kernel/drivers/net/wireless/mediatek/$PACKAGE_NAME"
+-AUTOINSTALL="yes"
++AUTOINSTALL="no"
