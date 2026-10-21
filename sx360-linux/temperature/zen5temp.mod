@@ -1,2 +1,0 @@
-/home/starry/下载/mt76/sx360-linux/temperature/zen5temp.o
-
